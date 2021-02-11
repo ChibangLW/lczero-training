@@ -1,0 +1,32 @@
+%YAML 1.2
+---
+prefix: 'pbt1'                  # prefix to network name
+gpus: 
+  - 0                                 # gpu id to process on 0 (Make sure to have enough CPU resources) training will be excuted in parallel
+
+dataset: 
+  num_chunks: 250000                    # newest nof chunks to parse
+  train_ratio: 0.80                    # trainingset ratio
+  # For separated test and train data.
+  input_train: '/path/to/training-data/train/' # supports glob
+  input_test: '/path/to/training-data/test/'  # supports glob
+
+
+pbt: 
+  config_directory: '/path/to/configs/pbt/' # directory to save the configs for different populations
+  population_size: 8                # should be an even number
+  evolutions: 100                   # Number of desired evolution
+  evolution_size: 2000              # Number of steps per evolution
+  lc0_path: '/path/to/lczero/execuable/' # Path to the lc0 executable
+  input_base: '/path/to/store/pbt-training-data/' # folder to store the prepared data for each evolution
+  network_path: '/path/to/networks/'                # network storage dir
+  evaluation_games: 50    # how many games to play with lc0 to get best agent
+
+
+model:
+  filters: 128
+  residual_blocks: 10
+  se_ratio: 8
+  policy_channels: 32
+  # virtual_batch_size: None
+...

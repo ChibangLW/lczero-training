@@ -71,6 +71,14 @@ tensorboard --logdir leelalogs
 
 If you now point your browser at localhost:6006 you'll see the trainingprogress as the trainingsteps pass by. Have fun!
 
+## PBT pipeline
+
+The PBT pipeline trains a model by levarging Population Based Training. As the name suggests a population is used to learn more effectivly by always choosing the best performing agent of the population. The goal ist to finde optimal hyperparameters and adjust them on the fly. For configuration use `configs/pbt_config.yaml` and `configs/agents/base_agent_config.yaml`.
+
+```bash
+python pbt.py --cfg configs/pbt_config.yaml --setup true --prep_data true
+```
+
 ## Restoring models
 
 The training pipeline will automatically restore from a previous model if it exists in your `training:path` as configured by your yaml config. For initializing from a raw `weights.txt` file you can use `training/tf/net_to_model.py`, this will create a checkpoint for you.
