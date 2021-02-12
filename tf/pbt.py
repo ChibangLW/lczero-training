@@ -29,9 +29,8 @@ def get_epsilon(current_lr: float) -> float:
 def train_on_gpu(gpu_id, evolution_id): 
     for agent in models.get_agents_by_gpu(evolution_id, gpu_id):
         print("Training agent ",agent, " on gpu ", gpu_id)
-        time.sleep(1)
-        # config_file = util.get_config_file_name(agent["uuid"], config_dir)
-        # os.system("python train.py --cfg " + config_file)
+        config_file = util.get_config_file_name(agent["uuid"], config_dir)
+        os.system("python train.py --cfg " + config_file)
 
 
 def train(evolution_id: int, gpus):
