@@ -107,6 +107,9 @@ venv.bak/
 # protobuf stuff
 tf/proto/
 
+# Tensorflow logs
+tf/leelalogs
+
 *.db
 
 tf/configs/*.yaml
