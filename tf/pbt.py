@@ -69,7 +69,7 @@ def play_matches(evolution_id: int, games: int):
             weights_b = util.get_weights_file(
                 op_b, network_dir, name, evolution["steps_stop"])
 
-            args = [lc0_path+"lc0", "selfplay", "--player1.weights="+weights_a, "--player2.weights=" + weights_b, "--games=" + games, "--movetime=500000"] 
+            args = [lc0_path+"lc0", "selfplay", "--player1.weights="+weights_a, "--player2.weights=" + weights_b, "--games=" + str(games), "--movetime=500000"] 
             process = subprocess.Popen(args, stdout=subprocess.PIPE)
            
 
