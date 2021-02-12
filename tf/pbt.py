@@ -94,7 +94,7 @@ def init_population(evolution_id: int, model_name: str, population_size: int, gp
             agent_id = models.create_agent(evolution_id, i, init_lr, gpus[i%len(gpus)])
 
 
-            # util.create_config_file(agent_id, config_dir, pbt_input_base_dir)
+            util.create_config_file(agent_id, config_dir, pbt_input_base_dir)
         return
 
     print("Population for Evolution " + str(evolution_id) + " already created")
