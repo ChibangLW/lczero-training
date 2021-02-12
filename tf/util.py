@@ -47,8 +47,8 @@ def create_config_file(agent_id: int, config_dir, pbt_input_base_dir):
 
             cfg['dataset']['input_train'] = get_pbt_train_path(evolution["iteration"], pbt_input_base_dir)
             cfg['dataset']['input_test'] = get_pbt_test_path(evolution["iteration"], pbt_input_base_dir)
-            cfg['dataset']['num_chunks'] = evolution_size * 6
-            cfg['dataset']['train_ratio'] = float(1/5)
+            cfg['dataset']['num_chunks'] = evolution_size * 25
+            cfg['dataset']['train_ratio'] = float(20/25)
 
             # cfg['training']['policy_loss_weight'] = policy_loss_weight
             # cfg['training']['value_loss_weight'] = value_loss_weight
@@ -108,12 +108,12 @@ def prepare_training_data(evolution_num: int, evolution_size: int, train_data_di
 
         ## Train data
         train_file_list = _get_file_list(train_data_dir)
-        train_random_files = _get_random_files(train_file_list, evolution_size*5)
+        train_random_files = _get_random_files(train_file_list, evolution_size*20)
         _copy_files(train_random_files, train_data_dir, train_path)
 
         ## Train data
         test_file_list = _get_file_list(test_data_dir)
-        test_random_files = _get_random_files(test_file_list, evolution_size*1)
+        test_random_files = _get_random_files(test_file_list, evolution_size*5)
         _copy_files(test_random_files, test_data_dir, test_path)
 
         print("Evolution " + str(evolution) + " done")
