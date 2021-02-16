@@ -15,6 +15,14 @@ wget https://storage.lczero.org/files/training_data/training-run1--20200711-2017
 tar -xzf training-run1--20200711-2017.tar
 ```
 
+## PBT pipeline
+
+The PBT pipeline trains a model by levarging Population Based Training. As the name suggests a population is used to learn more effectivly by always choosing the best performing agent of the population. The goal ist to finde optimal hyperparameters and adjust them on the fly. For configuration use `configs/pbt_config.yaml` and `configs/agents/base_agent_config.yaml`.  You can find our paper [here](./Population_Based_Training_for_Reinforcement.pdf)
+
+```bash
+python pbt.py --cfg configs/pbt_config.yaml --setup true --prep_data true
+```
+
 ## Training pipeline
 
 Now that the data is in the right format one can configure a training pipeline. This configuration is achieved through a yaml file, see `training/tf/configs/example.yaml`:
@@ -70,14 +78,6 @@ tensorboard --logdir leelalogs
 ```
 
 If you now point your browser at localhost:6006 you'll see the trainingprogress as the trainingsteps pass by. Have fun!
-
-## PBT pipeline
-
-The PBT pipeline trains a model by levarging Population Based Training. As the name suggests a population is used to learn more effectivly by always choosing the best performing agent of the population. The goal ist to finde optimal hyperparameters and adjust them on the fly. For configuration use `configs/pbt_config.yaml` and `configs/agents/base_agent_config.yaml`.
-
-```bash
-python pbt.py --cfg configs/pbt_config.yaml --setup true --prep_data true
-```
 
 ## Restoring models
 
