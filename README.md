@@ -17,7 +17,7 @@ tar -xzf training-run1--20200711-2017.tar
 
 ## PBT pipeline
 
-The PBT pipeline trains a model by levarging Population Based Training. As the name suggests a population is used to learn more effectivly by always choosing the best performing agent of the population. The goal ist to finde optimal hyperparameters and adjust them on the fly. For configuration use `configs/pbt_config.yaml` and `configs/agents/base_agent_config.yaml`.  You can find our paper [here](./Population_Based_Training_for_Reinforcement.pdf)
+The PBT pipeline trains a model by levarging Population Based Training. As the name suggests a population is used to learn more effectivly by always choosing the best performing agent of the population. The goal ist to finde optimal hyperparameters and adjust them on the fly. For configuration use `configs/pbt_config.yaml` and `configs/agents/base_agent_config.yaml`.  You can find our paper [here](docs/Population_Based_Training_for_Reinforcement.pdf) and graphs with fixed overfitting are [here](docs/graphs)
 
 ```bash
 python pbt.py --cfg configs/pbt_config.yaml --setup true --prep_data true
