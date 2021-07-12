@@ -160,10 +160,20 @@ class TFProcess:
         self.renorm_momentum = self.cfg['training'].get(
             'renorm_momentum', 0.99)
 
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        tf.config.experimental.set_visible_devices(gpus[self.cfg['gpu']],
-                                                   'GPU')
-        tf.config.experimental.set_memory_growth(gpus[self.cfg['gpu']], True)
+        if self.cfg['gpu'] == 'all':
+            gpus = tf.config.experimental.list_physical_devices('GPU')
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            self.strategy = tf.distribute.MirroredStrategy()
+            tf.distribute.experimental_set_strategy(self.strategy)
+        else:
+            gpus = tf.config.experimental.list_physical_devices('GPU')
+            print(gpus)
+            tf.config.experimental.set_visible_devices(gpus[self.cfg['gpu']],
+                                                       'GPU')
+            tf.config.experimental.set_memory_growth(gpus[self.cfg['gpu']],
+                                                     True)
+            self.strategy = None
         if self.model_dtype == tf.float16:
             tf.keras.mixed_precision.experimental.set_policy('mixed_float16')
 
@@ -173,12 +183,29 @@ class TFProcess:
                                        dtype=tf.int64)
 
     def init_v2(self, train_dataset, test_dataset, validation_dataset=None):
-        self.train_dataset = train_dataset
-        self.train_iter = iter(train_dataset)
-        self.test_dataset = test_dataset
-        self.test_iter = iter(test_dataset)
-        self.validation_dataset = validation_dataset
-        self.init_net_v2()
+        if self.strategy is not None:
+            self.train_dataset = self.strategy.experimental_distribute_dataset(
+                train_dataset)
+        else:
+            self.train_dataset = train_dataset
+        self.train_iter = iter(self.train_dataset)
+        if self.strategy is not None:
+            self.test_dataset = self.strategy.experimental_distribute_dataset(
+                test_dataset)
+        else:
+            self.test_dataset = train_dataset
+        self.test_iter = iter(self.test_dataset)
+        if self.strategy is not None and validation_dataset is not None:
+            self.validation_dataset = self.strategy.experimental_distribute_dataset(
+                validation_dataset)
+        else:
+            self.validation_dataset = validation_dataset
+        if self.strategy is not None:
+            this = self
+            with self.strategy.scope():
+                this.init_net_v2()
+        else:
+            self.init_net_v2()
 
     def init_net_v2(self):
         self.l2reg = tf.keras.regularizers.l2(l=0.5 * (0.0001))
@@ -317,7 +344,11 @@ class TFProcess:
                 scale = 20.0
                 target = target / scale
                 output = tf.cast(output, tf.float32) / scale
-                huber = tf.keras.losses.Huber(10.0 / scale)
+                if self.strategy is not None:
+                    huber = tf.keras.losses.Huber(
+                        10.0 / scale, reduction=tf.keras.losses.Reduction.NONE)
+                else:
+                    huber = tf.keras.losses.Huber(10.0 / scale)
                 return tf.reduce_mean(huber(target, output))
         else:
             moves_left_loss = None
@@ -481,9 +512,24 @@ class TFProcess:
             self.checkpoint.restore(self.manager.latest_checkpoint)
 
     def process_loop_v2(self, batch_size, test_batches, batch_splits=1):
+        if self.swa_enabled:
+            # split half of test_batches between testing regular weights and SWA weights
+            test_batches //= 2
+        # Make sure that ghost batch norm can be applied
+        if self.virtual_batch_size and batch_size % self.virtual_batch_size != 0:
+            # Adjust required batch size for batch splitting.
+            required_factor = self.virtual_batch_size * self.cfg[
+                'training'].get('num_batch_splits', 1)
+            raise ValueError(
+                'batch_size must be a multiple of {}'.format(required_factor))
+
         # Get the initial steps value in case this is a resume from a step count
         # which is not a multiple of total_steps.
         steps = self.global_step.read_value()
+        self.last_steps = steps
+        self.time_start = time.time()
+        self.profiling_start_step = None
+
         total_steps = self.cfg['training']['total_steps']
         for _ in range(steps % total_steps, total_steps):
             self.process_v2(batch_size,
@@ -513,7 +559,6 @@ class TFProcess:
                 moves_left_loss = self.moves_left_loss_fn(m, moves_left)
             else:
                 moves_left_loss = tf.constant(0.)
-
             total_loss = self.lossMix(policy_loss, value_loss,
                                       moves_left_loss) + reg_term
             if self.loss_scale != 1:
@@ -525,44 +570,55 @@ class TFProcess:
         return policy_loss, value_loss, mse_loss, moves_left_loss, reg_term, tape.gradient(
             total_loss, self.model.trainable_weights)
 
-    def process_v2(self, batch_size, test_batches, batch_splits=1):
-        if not self.time_start:
-            self.time_start = time.time()
+    @tf.function()
+    def strategy_process_inner_loop(self, x, y, z, q, m):
+        policy_loss, value_loss, mse_loss, moves_left_loss, reg_term, new_grads = self.strategy.run(
+            self.process_inner_loop, args=(x, y, z, q, m))
+        policy_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                           policy_loss,
+                                           axis=None)
+        value_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                          value_loss,
+                                          axis=None)
+        mse_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                        mse_loss,
+                                        axis=None)
+        moves_left_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                               moves_left_loss,
+                                               axis=None)
+        reg_term = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                        reg_term,
+                                        axis=None)
+        return policy_loss, value_loss, mse_loss, moves_left_loss, reg_term, new_grads
 
-        # Get the initial steps value before we do a training step.
-        steps = self.global_step.read_value()
-        if not self.last_steps:
-            self.last_steps = steps
+    def apply_grads(self, grads, effective_batch_splits):
+        if self.loss_scale != 1:
+            grads = self.optimizer.get_unscaled_gradients(grads)
+        max_grad_norm = self.cfg['training'].get(
+            'max_grad_norm', 10000.0) * effective_batch_splits
+        grads, grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
+        self.optimizer.apply_gradients(zip(grads,
+                                           self.model.trainable_weights))
+        return grad_norm
 
-        if self.swa_enabled:
-            # split half of test_batches between testing regular weights and SWA weights
-            test_batches //= 2
+    @tf.function()
+    def strategy_apply_grads(self, grads, effective_batch_splits):
+        grad_norm = self.strategy.run(self.apply_grads,
+                                      args=(grads, effective_batch_splits))
+        grad_norm = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                         grad_norm,
+                                         axis=None)
+        return grad_norm
 
-        # Run test before first step to see delta since end of last run.
-        if steps % self.cfg['training']['total_steps'] == 0:
-            # Steps is given as one higher than current in order to avoid it
-            # being equal to the value the end of a run is stored against.
-            self.calculate_test_summaries_v2(test_batches, steps + 1)
-            if self.swa_enabled:
-                self.calculate_swa_summaries_v2(test_batches, steps + 1)
+    @tf.function()
+    def merge_grads(self, grads, new_grads):
+        return [tf.math.add(a, b) for (a, b) in zip(grads, new_grads)]
 
-        # Make sure that ghost batch norm can be applied
-        if self.virtual_batch_size and batch_size % self.virtual_batch_size != 0:
-            # Adjust required batch size for batch splitting.
-            required_factor = self.virtual_batch_size * self.cfg[
-                'training'].get('num_batch_splits', 1)
-            raise ValueError(
-                'batch_size must be a multiple of {}'.format(required_factor))
+    @tf.function()
+    def strategy_merge_grads(self, grads, new_grads):
+        return self.strategy.run(self.merge_grads, args=(grads, new_grads))
 
-        # Determine learning rate
-        lr_values = self.cfg['training']['lr_values']
-        lr_boundaries = self.cfg['training']['lr_boundaries']
-        steps_total = steps % self.cfg['training']['total_steps']
-        self.lr = lr_values[bisect.bisect_right(lr_boundaries, steps_total)]
-        if self.warmup_steps > 0 and steps < self.warmup_steps:
-            self.lr = self.lr * tf.cast(steps + 1,
-                                        tf.float32) / self.warmup_steps
-
+    def train_step(self, steps, batch_size, batch_splits):
         # need to add 1 to steps because steps will be incremented after gradient update
         if (steps +
                 1) % self.cfg['training']['train_avg_report_steps'] == 0 or (
@@ -573,12 +629,19 @@ class TFProcess:
         grads = None
         for _ in range(batch_splits):
             x, y, z, q, m = next(self.train_iter)
-            policy_loss, value_loss, mse_loss, moves_left_loss, reg_term, new_grads = self.process_inner_loop(
-                x, y, z, q, m)
+            if self.strategy is not None:
+                policy_loss, value_loss, mse_loss, moves_left_loss, reg_term, new_grads = self.strategy_process_inner_loop(
+                    x, y, z, q, m)
+            else:
+                policy_loss, value_loss, mse_loss, moves_left_loss, reg_term, new_grads = self.process_inner_loop(
+                    x, y, z, q, m)
             if not grads:
                 grads = new_grads
             else:
-                grads = [tf.math.add(a, b) for (a, b) in zip(grads, new_grads)]
+                if self.strategy is not None:
+                    grads = self.strategy_merge_grads(grads, new_grads)
+                else:
+                    grads = self.merge_grads(grads, new_grads)
             # Keep running averages
             # Google's paper scales MSE by 1/4 to a [0, 1] range, so do the same to
             # get comparable values.
@@ -591,14 +654,19 @@ class TFProcess:
             self.avg_mse_loss.append(mse_loss)
             self.avg_reg_term.append(reg_term)
         # Gradients of batch splits are summed, not averaged like usual, so need to scale lr accordingly to correct for this.
-        self.active_lr = self.lr / batch_splits
-        if self.loss_scale != 1:
-            grads = self.optimizer.get_unscaled_gradients(grads)
-        max_grad_norm = self.cfg['training'].get('max_grad_norm',
-                                                 10000.0) * batch_splits
-        grads, grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
-        self.optimizer.apply_gradients(zip(grads,
-                                           self.model.trainable_weights))
+        effective_batch_splits = batch_splits
+        if self.strategy is not None:
+            effective_batch_splits = batch_splits * self.strategy.num_replicas_in_sync
+        self.active_lr = self.lr / effective_batch_splits
+        if self.strategy is not None:
+            grad_norm = self.strategy_apply_grads(grads,
+                                                  effective_batch_splits)
+        else:
+            grad_norm = self.apply_grads(grads, effective_batch_splits)
+
+        # Note: grads variable at this point has not been unscaled or
+        # had clipping applied. Since no code after this point depends
+        # upon that it seems fine for now.
 
         # Update steps.
         self.global_step.assign_add(1)
@@ -642,7 +710,7 @@ class TFProcess:
                 tf.summary.scalar("Reg term", avg_reg_term, step=steps)
                 tf.summary.scalar("LR", self.lr, step=steps)
                 tf.summary.scalar("Gradient norm",
-                                  grad_norm / batch_splits,
+                                  grad_norm / effective_batch_splits,
                                   step=steps)
                 tf.summary.scalar("MSE Loss", avg_mse_loss, step=steps)
                 self.compute_update_ratio_v2(before_weights, after_weights,
@@ -655,6 +723,41 @@ class TFProcess:
             self.avg_value_loss = []
             self.avg_mse_loss = []
             self.avg_reg_term = []
+        return steps
+
+    def process_v2(self, batch_size, test_batches, batch_splits):
+        # Get the initial steps value before we do a training step.
+        steps = self.global_step.read_value()
+
+        # By default disabled since 0 != 10.
+        if steps % self.cfg['training'].get('profile_step_freq',
+                                            1) == self.cfg['training'].get(
+                                                'profile_step_offset', 10):
+            self.profiling_start_step = steps
+            tf.profiler.experimental.start(
+                os.path.join(os.getcwd(),
+                             "leelalogs/{}-profile".format(self.cfg['name'])))
+
+        # Run test before first step to see delta since end of last run.
+        if steps % self.cfg['training']['total_steps'] == 0:
+            with tf.profiler.experimental.Trace("Test", step_num=steps + 1):
+                # Steps is given as one higher than current in order to avoid it
+                # being equal to the value the end of a run is stored against.
+                self.calculate_test_summaries_v2(test_batches, steps + 1)
+                if self.swa_enabled:
+                    self.calculate_swa_summaries_v2(test_batches, steps + 1)
+
+        # Determine learning rate
+        lr_values = self.cfg['training']['lr_values']
+        lr_boundaries = self.cfg['training']['lr_boundaries']
+        steps_total = steps % self.cfg['training']['total_steps']
+        self.lr = lr_values[bisect.bisect_right(lr_boundaries, steps_total)]
+        if self.warmup_steps > 0 and steps < self.warmup_steps:
+            self.lr = self.lr * tf.cast(steps + 1,
+                                        tf.float32) / self.warmup_steps
+
+        with tf.profiler.experimental.Trace("Train", step_num=steps):
+            steps = self.train_step(steps, batch_size, batch_splits)
 
         if self.swa_enabled and steps % self.cfg['training']['swa_steps'] == 0:
             self.update_swa_v2()
@@ -663,17 +766,19 @@ class TFProcess:
         # one at the final step so the delta to the first step can be calculted.
         if steps % self.cfg['training']['test_steps'] == 0 or steps % self.cfg[
                 'training']['total_steps'] == 0:
-            self.calculate_test_summaries_v2(test_batches, steps)
-            if self.swa_enabled:
-                self.calculate_swa_summaries_v2(test_batches, steps)
+            with tf.profiler.experimental.Trace("Test", step_num=steps):
+                self.calculate_test_summaries_v2(test_batches, steps)
+                if self.swa_enabled:
+                    self.calculate_swa_summaries_v2(test_batches, steps)
 
         if self.validation_dataset is not None and (
                 steps % self.cfg['training']['validation_steps'] == 0
                 or steps % self.cfg['training']['total_steps'] == 0):
-            if self.swa_enabled:
-                self.calculate_swa_validations_v2(steps)
-            else:
-                self.calculate_test_validations_v2(steps)
+            with tf.profiler.experimental.Trace("Validate", step_num=steps):
+                if self.swa_enabled:
+                    self.calculate_swa_validations_v2(steps)
+                else:
+                    self.calculate_test_validations_v2(steps)
 
         # Save session and weights at end, and also optionally every 'checkpoint_steps'.
         if steps % self.cfg['training']['total_steps'] == 0 or (
@@ -690,6 +795,13 @@ class TFProcess:
             self.save_leelaz_weights_v2(leela_path)
             if self.swa_enabled:
                 self.save_swa_weights_v2(swa_path)
+
+        if self.profiling_start_step is not None and (
+                steps >= self.profiling_start_step +
+                self.cfg['training'].get('profile_step_count', 0)
+                or steps % self.cfg['training']['total_steps'] == 0):
+            tf.profiler.experimental.stop()
+            self.profiling_start_step = None
 
     def calculate_swa_summaries_v2(self, test_batches, steps):
         backup = self.read_weights()
@@ -726,7 +838,38 @@ class TFProcess:
         else:
             moves_left_loss = tf.constant(0.)
             moves_left_mean_error = tf.constant(0.)
+        return policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul
 
+    @tf.function()
+    def strategy_calculate_test_summaries_inner_loop(self, x, y, z, q, m):
+        policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.strategy.run(
+            self.calculate_test_summaries_inner_loop, args=(x, y, z, q, m))
+        policy_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                           policy_loss,
+                                           axis=None)
+        value_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                          value_loss,
+                                          axis=None)
+        mse_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                        mse_loss,
+                                        axis=None)
+        policy_accuracy = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                               policy_accuracy,
+                                               axis=None)
+        value_accuracy = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                              value_accuracy,
+                                              axis=None)
+        moves_left_loss = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                               moves_left_loss,
+                                               axis=None)
+        moves_left_mean_error = self.strategy.reduce(
+            tf.distribute.ReduceOp.MEAN, moves_left_mean_error, axis=None)
+        policy_entropy = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                              policy_entropy,
+                                              axis=None)
+        policy_ul = self.strategy.reduce(tf.distribute.ReduceOp.MEAN,
+                                         policy_ul,
+                                         axis=None)
         return policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul
 
     def calculate_test_summaries_v2(self, test_batches, steps):
@@ -741,8 +884,12 @@ class TFProcess:
         sum_policy_ul = 0
         for _ in range(0, test_batches):
             x, y, z, q, m = next(self.test_iter)
-            policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.calculate_test_summaries_inner_loop(
-                x, y, z, q, m)
+            if self.strategy is not None:
+                policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.strategy_calculate_test_summaries_inner_loop(
+                    x, y, z, q, m)
+            else:
+                policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.calculate_test_summaries_inner_loop(
+                    x, y, z, q, m)
             sum_policy_accuracy += policy_accuracy
             sum_policy_entropy += policy_entropy
             sum_policy_ul += policy_ul
@@ -829,8 +976,12 @@ class TFProcess:
         sum_policy_ul = 0
         counter = 0
         for (x, y, z, q, m) in self.validation_dataset:
-            policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.calculate_test_summaries_inner_loop(
-                x, y, z, q, m)
+            if self.strategy is not None:
+                policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.strategy_calculate_test_summaries_inner_loop(
+                    x, y, z, q, m)
+            else:
+                policy_loss, value_loss, moves_left_loss, mse_loss, policy_accuracy, value_accuracy, moves_left_mean_error, policy_entropy, policy_ul = self.calculate_test_summaries_inner_loop(
+                    x, y, z, q, m)
             sum_policy_accuracy += policy_accuracy
             sum_policy_entropy += policy_entropy
             sum_policy_ul += policy_ul
